@@ -5,7 +5,10 @@
   "author": "Josh King <josh@throneless.tech>",
   "license": "AGPL-3.0-or-later",
   "keywords": "hubot, hubot-scripts",
-  "main": "src/token.js",
+  "main": "index.js",
+  "files": [
+    "/src"
+  ],
   "scripts": {
     "test": "mocha",
     "lint": "npx eslint ./src/*.js"

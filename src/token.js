@@ -16,21 +16,32 @@
 //     The setting defaults to 'true'.
 //
 // Commands:
-//   hubot list lists - list all list names
-//   hubot list dump - list all list names and members
-//   hubot list create <list> - create a new list
-//   hubot list destroy <list> - destroy a list
-//   hubot list rename <old> <new> - rename a list
-//   hubot list add <list> <name> - add name to a list
-//   hubot list remove <list> <name> - remove name from a list
-//   hubot list info <list> - list members in list
-//   hubot list membership <name> - list lists that name is in
+//   hubot token show buckets - list all token buckets
+//   hubot token create bucket <bucket> - create a new token bucket
+//   hubot token destroy bucket <bucket> - destroy a token bucket
+//   hubot token issue <number> tokens from <bucket> to <user> - issue tokens
 //
 // Author:
 //   Josh King <jking@chambana.net>, based on hubot-group by anishathalye
 //
 
+const crypto = require("crypto");
 const IDENTIFIER = "[-._a-zA-Z0-9]+";
+
+function random(howMany, chars) {
+  chars =
+    chars || "abcdefghijklmnopqrstuwxyzABCDEFGHIJKLMNOPQRSTUWXYZ0123456789";
+  const rnd = crypto.randomBytes(howMany);
+  const value = new Array(howMany);
+  const len = Math.min(256, chars.length);
+  const d = 256 / len;
+
+  for (let i = 0; i < howMany; i++) {
+    value[i] = chars[Math.floor(rnd[i] / d)];
+  }
+
+  return value.join("");
+}
 
 function sorted(arr) {
   const copy = Array.from(arr);
@@ -38,124 +49,198 @@ function sorted(arr) {
 }
 
 function isString(s) {
-  return typeof s === 'string' || s instanceof String;
+  return typeof s === "string" || s instanceof String;
 }
 
-module.exports = robot => {
-  class BucketList {
-    constructor() {
-      robot.brain.on("loaded", this.load);
-      if (robot.brain.data.users.length) {
-        this.load();
+class BucketList {
+  constructor(robot) {
+    this.load = this.load.bind(this);
+    this.buckets = this.buckets.bind(this);
+    this.exists = this.exists.bind(this);
+    this.get = this.get.bind(this);
+    this.set = this.set.bind(this);
+    this.rename = this.rename.bind(this);
+    this.robot = robot;
+    this.cache = {};
+    this.robot.brain.on("loaded", this.load);
+    if (this.robot.brain.data.users.length) {
+      this.load();
+    }
+  }
+
+  load() {
+    if (this.robot.brain.data.tokens) {
+      this.cache = this.robot.brain.data.tokens;
+      Object.entries(this.robot.brain.data.tokens).forEach(([name, bucket]) => {
+        if (bucket) {
+          const deserialized = new Bucket();
+          deserialized.load(bucket._data);
+          this.cache[name] = deserialized;
+        }
+      });
+    } else {
+      this.robot.brain.data.tokens = this.cache;
+    }
+  }
+
+  buckets() {
+    return sorted(Object.keys(this.cache));
+  }
+
+  exists(bucket) {
+    return this.cache[bucket] != null;
+  }
+
+  get(bucket) {
+    return this.cache[bucket];
+  }
+
+  set(id, bucket) {
+    if (bucket instanceof Bucket && !this.exists(id)) {
+      this.cache[id] = bucket;
+      return true;
+    }
+    return false;
+  }
+
+  delete(id) {
+    if (this.exists(id)) {
+      delete this.cache[id];
+      return true;
+    }
+    return false;
+  }
+
+  rename(from, to) {
+    if (!this.exists(from) || this.exists(to)) {
+      return false;
+    } else {
+      this.cache[to] = this.cache[from];
+      delete this.cache[from];
+      return true;
+    }
+  }
+
+  [Symbol.iterator]() {
+    return Object.entries(this.cache);
+  }
+}
+
+class Bucket {
+  constructor() {
+    this.issue_to = this.issue_to.bind(this);
+    this.clean_expired = this.clean_expired.bind(this);
+    this.push = this.push.bind(this);
+    this.info = this.info.bind(this);
+    this._data = new Array();
+  }
+
+  load(data) {
+    this._data = Array.from(data).map(token => {
+      if (typeof token != Token) {
+        const t = new Token(
+          token._id,
+          token._worth,
+          token._expiry,
+          token._domain
+        );
+        t._added = token._added;
+        t._issued_date = token._issued_date;
+        t._issued_to = token._issued_to;
+        return t;
       }
-    }
+      return token;
+    });
+  }
 
-    load() {
-      if (robot.brain.data.list) {
-        this.cache = robot.brain.data.list;
-      } else {
-        robot.brain.data.list = this.cache;
+  issue_to(user, number = 1) {
+    let issued = [];
+    let count = 0;
+    this._data.forEach(token => {
+      if (!token.is_issued() && !token.is_expired() && count < number) {
+        issued.push(token.issue_to(user));
+        count++;
       }
-    }
+    });
+    return issued;
+  }
 
-    buckets() {
-      return sorted(Object.keys(this.cache));
-    }
+  clean_expired() {
+    this._data = this._data.filter(token => !token.is_expired);
+    return;
+  }
 
-    exists(bucket) {
-      return this.cache[bucket] != null;
-    }
+  push(token) {
+    return this._data.push(token);
+  }
 
-    get(bucket) {
-      return this.cache[bucket];
-    }
+  info() {
+    let issued = 0;
+    let expired = 0;
+    this._data.forEach(token => {
+      if (token.is_expired()) expired++;
+      if (token.is_issued()) issued++;
+    });
+    return { total: this._data.length, issued: issued, expired: expired };
+  }
+}
 
-    set(id, bucket) {
-      if (bucket instanceof Bucket && !this.exists(id)) {
-        this.cache[id] = bucket;
-        return true;
-      }
+class Token {
+  constructor(id, worth, expiry, domain) {
+    this.issue_to = this.issue_to.bind(this);
+    this.is_issued = this.is_issued.bind(this);
+    this.is_expired = this.is_expired.bind(this);
+    this._id = id;
+    this._worth = worth;
+    this._expiry = expiry;
+    this._domain = domain;
+    this._added = new Date();
+    this._issued_to = null;
+    this._issued_date = null;
+  }
+
+  issue_to(to) {
+    this._issued_to = to;
+    this._issued_date = new Date();
+    return {
+      id: this._id,
+      worth: this._worth,
+      expiry: this._expiry,
+      domain: this._domain
+    };
+  }
+
+  is_issued() {
+    return this._issued_to != null;
+  }
+
+  is_expired() {
+    if (this._expiry != null) {
+      const now = new Date();
+      return this._expiry.getTime() < now.getTime();
+    } else {
       return false;
     }
-
-    rename(from, to) {
-      if (!this.exists(from) || this.exists(to)) {
-        return false;
-      } else {
-        this.cache[to] = this.cache[from];
-        delete this.cache[from];
-        return true;
-      }
-    }
   }
+}
 
-  class Bucket {
-    constructor() {
-      this._data = new Array();
-    }
-
-    includes(token) {
-      return this._data.includes(token);
-    }
-
-    push(token) {
-      return this._data.push(token);
-    }
-
-    pop(token) {
-      return this._data.pop(token);
-    }
-  }
-
-  class Token {
-    constructor(uid, worth, expiry, domain) {
-      this._uid = uid;
-      this._worth = worth;
-      this._expiry = expiry;
-      this._domain = domain;
-      this._added = new Date();
-      this._issued_date = null;
-      this._issued_to = null;
-    }
-
-    issue_to(to) {
-      this._issued_to = to;
-      this._issued_data = new Date();
-      return;
-    }
-
-    expired() {
-      let now = new Date();
-      return this._expiry.getTime() < now.getTime();
-    }
-  }
-
-  robot.tokens = new BucketList();
+module.exports = function(robot) {
+  const tokens = new BucketList(robot);
 
   robot.listenerMiddleware((context, next, done) => {
-    if (context.listener.options.id === "list.send") {
-      if (Array.from(LIST_ADMINS).includes(context.response.message.user.id)) {
-        // User is allowed access to this command
-        return next();
-      } else {
-        // Fail silently
-        return done();
-      }
-    } else if (
+    if (
       context.listener.options.id &&
       context.listener.options.id.match(
-        new RegExp(`^list\\.[a-zA-Z0-9]+$`, "i")
+        new RegExp(`^token\\.[a-zA-Z0-9]+$`, "i")
       )
     ) {
-      if (Array.from(LIST_ADMINS).includes(context.response.message.user.id)) {
+      if (robot.auth.isAdmin(context.response.message.user.id)) {
         // User is allowed access to this command
         return next();
       } else {
         // Restricted command, but user isn't in whitelist
         context.response.reply(
-          `I'm sorry, @${
-            context.response.message.user.name
-          }, but you don't have access to do that.`
+          `I'm sorry, @${context.response.message.user.name}, but you don't have access to do that.`
         );
         return done();
       }
@@ -165,215 +250,135 @@ module.exports = robot => {
     }
   });
 
-  robot.hear(new RegExp(`@${IDENTIFIER}`), { id: "list.send" }, res => {
-    let mem;
-    const response = [];
-    const tagged = [];
-    for (var g of Array.from(robot.list.lists())) {
-      if (new RegExp(`(^|\\s)@${g}\\b`).test(res.message.text)) {
-        tagged.push(g);
-      }
-    }
-    if (LIST_RECURSE !== "false") {
-      const process = Array.from(tagged);
-      while (process.length > 0) {
-        g = process.shift();
-        for (mem of Array.from(robot.list.members(g))) {
-          if (mem[0] === "&") {
-            mem = mem.substring(1);
-            // it's a list
-            if (
-              !Array.from(process).includes(mem) &&
-              !Array.from(tagged).includes(mem)
-            ) {
-              tagged.push(mem);
-              process.push(mem);
-            }
-          }
-        }
-      }
-    }
-    // output results
-    const decorated = {};
-    const decorateOnce = name => {
-      if (name[0] === "&" || decorated[name]) {
-        return name;
+  robot.respond(
+    "/token create bucket (.*)/i",
+    { id: "token.bucket_add" },
+    res => {
+      const name = res.match[1];
+      const type = res.match[2];
+      let success = false;
+      if (type === "mullvad" || type === "Mullvad") {
+        const bucket = new Bucket();
+        success = tokens.set(name, bucket);
       } else {
-        decorated[name] = true;
-        return decorate(name);
+        const bucket = new Bucket();
+        success = tokens.set(name, bucket);
       }
-    };
-    let { text } = res.message;
-    if (LIST_PREPEND_USERNAME === "true") {
-      text = `${res.message.user.name}: ${message}`;
+
+      if (success) {
+        res.send(`Added new token bucket ${name}.`);
+      } else {
+        res.send(`Token bucket ${name} already exists.`);
+      }
     }
-    return (() => {
-      const result = [];
-      for (g of Array.from(tagged)) {
-        mem = robot.list.members(g);
-        if (mem.length > 0) {
-          if (["SlackBot", "Room"].includes(robot.adapter.constructor.name)) {
-            result.push(
-              (() => {
-                const result1 = [];
-                for (let m of Array.from(mem)) {
-                  const room = robot.adapter.client.rtm.dataStore.getDMByName(
-                    m
-                  );
-                  result1.push(res.send({ room: room.id }, text));
-                }
-                return result1;
-              })()
-            );
-          } else if (["Signal"].includes(robot.adapter.constructor.name)) {
-            result.push(
-              (() => {
-                const result1 = [];
-                for (let m of Array.from(mem)) {
-                  result1.push(robot.messageRoom("+" + m, text));
-                }
-                return result1;
-              })()
-            );
+  );
+
+  robot.respond(
+    "/token destroy bucket (.*)/i",
+    { id: "token.bucket_remove" },
+    res => {
+      const name = res.match[1];
+      let success = false;
+      if (tokens.exists(name)) {
+        success = tokens.delete(name);
+      }
+      if (success) {
+        res.send(`Removed token bucket ${name}.`);
+      } else {
+        res.send(`Token bucket ${name} doesn't exist.`);
+      }
+    }
+  );
+
+  robot.respond(
+    "/token add token to (.*)/i",
+    { id: "token.token_add" },
+    res => {
+      const bucket = res.match[1];
+      let success = false;
+      if (tokens.exists(bucket)) {
+        const b = tokens.get(bucket);
+        b.push(
+          new Token(
+            random(10),
+            "2 days",
+            null,
+            "http://privateinternetaccess.com"
+          )
+        );
+        res.send(`Added token to bucket ${bucket}.`);
+      } else {
+        res.send(`Token bucket ${bucket} doesn't exist.`);
+      }
+    }
+  );
+
+  robot.respond("/token show buckets/i", { id: "token.list_buckets" }, res => {
+    const response = [];
+    response.push("<Bucket>: (Total/Issued/Expired)");
+    Object.entries(tokens.cache).forEach(([name, bucket]) => {
+      let info = bucket.info();
+      response.push(`${name}: (${info.total}/${info.issued}/${info.expired})`);
+    });
+    if (response.length > 1) {
+      res.send(response.join("\n"));
+    } else {
+      res.send("No token buckets available.");
+    }
+  });
+
+  robot.respond("/token show users/i", { id: "token.list_users" }, res => {
+    const response = robot.auth.usersWithRole("recipients");
+    response.unshift("Users:");
+    if (response.length > 1) {
+      res.send(response.join("\n"));
+    } else {
+      res.send(
+        "No users available (given that you're a user, this may be an error!)."
+      );
+    }
+  });
+
+  robot.respond(
+    "/token issue (.*) tokens from (.*) to (.*)/i",
+    { id: "token.list_issue" },
+    res => {
+      const number = res.match[1] || 1;
+      const bucket = res.match[2];
+      const user = res.match[3];
+      if (tokens.exists(bucket)) {
+        if (robot.auth.hasRole(user, "recipients")) {
+          const issued = tokens.get(bucket).issue_to(user, number);
+          if (issued.length > 0) {
+            const response = [];
+            response.push("You have been issued the following tokens:");
+            issued.forEach(t => {
+              const tokenString = [];
+              if (t.id != null) {
+                tokenString.push(`Token: ${t.id}`);
+              }
+              if (t.domain != null) {
+                tokenString.push(`for site ${t.domain}`);
+              }
+              if (t.domain != null) {
+                tokenString.push(`worth ${t.worth}`);
+              }
+              if (t.expiry != null) {
+                tokenString.push(`expiring ${t.date.toDateString()}`);
+              }
+              tokenString.join(` `);
+              response.push(tokenString);
+            });
+            robot.messageRoom(user, response.join("\n"));
+            res.send(`Sent ${issued.length} tokens to ${user}.`);
           } else {
-            result.push(undefined);
+            res.send(`No tokens available in bucket ${bucket}.`);
           }
         } else {
-          result.push(undefined);
+          res.send(`User ${res.match[3]} is not a valid recipient.`);
         }
-      }
-      return result;
-    })();
-  });
-
-  robot.respond(new RegExp(`[L|l]ist\\s+lists`), { id: "list.lists" }, res =>
-    res.send(`Lists: ${robot.list.lists().join(", ")}`)
-  );
-
-  robot.respond(new RegExp(`[L|l]ist\\s+dump`), { id: "list.dump" }, res => {
-    const response = [];
-    for (let g of Array.from(robot.list.lists())) {
-      response.push(`*@${g}*: ${robot.list.members(g).join(", ")}`);
-    }
-    if (response.length > 0) {
-      res.send(response.join("\n"));
-    }
-  });
-
-  robot.respond(
-    new RegExp(`[L|l]ist\\s+create\\s+(${IDENTIFIER})`),
-    { id: "list.create" },
-    res => {
-      const name = res.match[1];
-      if (robot.list.create(name)) {
-        res.send(`Created list ${name}.`);
       } else {
-        res.send(`List ${name} already exists!`);
-      }
-    }
-  );
-
-  robot.respond(
-    new RegExp(`[L|l]ist\\s+destroy\\s+(${IDENTIFIER})`),
-    { id: "list.destroy" },
-    res => {
-      const name = res.match[1];
-      const old = robot.list.destroy(name);
-      if (old !== null) {
-        res.send(`Destroyed list ${name} (${old.join(", ")}).`);
-      } else {
-        res.send(`List ${name} does not exist!`);
-      }
-    }
-  );
-
-  robot.respond(
-    new RegExp(`[L|l]ist\\s+rename\\s+(${IDENTIFIER})\\s+(${IDENTIFIER})`),
-    { id: "list.rename" },
-    res => {
-      const from = res.match[1];
-      const to = res.match[2];
-      if (robot.list.rename(from, to)) {
-        res.send(`Renamed list ${from} to ${to}.`);
-      } else {
-        res.send(`Either list ${from} does not exist or ${to} already exists!`);
-      }
-    }
-  );
-
-  robot.respond(
-    new RegExp(
-      `[L|l]ist\\s+add\\s+(${IDENTIFIER})\\s+(&?${IDENTIFIER}(?:\\s+&?${IDENTIFIER})*)`
-    ),
-    { id: "list.add" },
-    res => {
-      const g = res.match[1];
-      let names = res.match[2];
-      names = names.split(/\s+/);
-      if (!robot.list.exists(g)) {
-        res.send(`List ${g} does not exist!`);
-        return;
-      }
-      const response = [];
-      for (let name of Array.from(names)) {
-        if (robot.list.add(g, name)) {
-          response.push(`${name} added to list ${g}.`);
-        } else {
-          response.push(`${name} is already in list ${g}!`);
-        }
-      }
-      res.send(response.join("\n"));
-    }
-  );
-
-  robot.respond(
-    new RegExp(
-      `[L|l]ist\\s+remove\\s+(${IDENTIFIER})\\s+(&?${IDENTIFIER}(?:\\s+&?${IDENTIFIER})*)`
-    ),
-    { id: "list.remove" },
-    res => {
-      const g = res.match[1];
-      let names = res.match[2];
-      names = names.split(/\s+/);
-      if (!robot.list.exists(g)) {
-        res.send(`List ${g} does not exist!`);
-        return;
-      }
-      const response = [];
-      for (let name of Array.from(names)) {
-        if (robot.list.remove(g, name)) {
-          response.push(`${name} removed from list ${g}.`);
-        } else {
-          response.push(`${name} is not in list ${g}!`);
-        }
-      }
-      res.send(response.join("\n"));
-    }
-  );
-
-  robot.respond(
-    new RegExp(`[L|l]ist\\s+info\\s+(${IDENTIFIER})`),
-    { id: "list.info" },
-    res => {
-      const name = res.match[1];
-      if (!robot.list.exists(name)) {
-        res.send(`List ${name} does not exist!`);
-        return;
-      }
-      res.send(`*@${name}*: ${robot.list.members(name).join(", ")}`);
-    }
-  );
-
-  robot.respond(
-    new RegExp(`[L|l]ist\\s+membership\\s+(&?${IDENTIFIER})`),
-    { id: "list.membership" },
-    res => {
-      const name = res.match[1];
-      const lists = robot.list.membership(name);
-      if (lists.length > 0) {
-        res.send(`${name} is in ${robot.list.membership(name).join(", ")}.`);
-      } else {
-        res.send(`${name} is not in any lists!`);
+        res.send(`Token bucket ${bucket} doesn't exist.`);
       }
     }
   );
