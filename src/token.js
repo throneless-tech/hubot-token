@@ -154,7 +154,7 @@ class Bucket {
   }
 
   issue_to(user, number = 1) {
-    let issued = [];
+    const issued = [];
     let count = 0;
     this._data.forEach(token => {
       if (!token.is_issued() && !token.is_expired() && count < number) {
@@ -349,6 +349,10 @@ module.exports = function(robot) {
       if (tokens.exists(bucket)) {
         if (robot.auth.hasRole(user, "recipients")) {
           const issued = tokens.get(bucket).issue_to(user, number);
+          const userObject = robot.brain.userForId(user);
+          userObject.issued = userObject.issued
+            ? (userObject.issued += issued)
+            : issued;
           if (issued.length > 0) {
             const response = [];
             response.push("You have been issued the following tokens:");
