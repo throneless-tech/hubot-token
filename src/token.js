@@ -25,8 +25,15 @@
 //   Josh King <jking@chambana.net>, based on hubot-group by anishathalye
 //
 
+const Papa = require("papaparse");
 const crypto = require("crypto");
+const fs = require("fs");
 const IDENTIFIER = "[-._a-zA-Z0-9]+";
+const TOKEN_STATE = { COMPLETED: 0, DUPLICATE: 1, INVALID: 2 };
+
+function isString(s) {
+  return typeof s === "string" || s instanceof String;
+}
 
 function random(howMany, chars) {
   chars =
@@ -132,68 +139,89 @@ class Bucket {
     this.clean_expired = this.clean_expired.bind(this);
     this.push = this.push.bind(this);
     this.info = this.info.bind(this);
-    this._data = new Array();
+    this._data = {};
   }
 
   load(data) {
-    this._data = Array.from(data).map(token => {
+    this._data = data;
+    Object.values(this._data).forEach(token => {
       if (typeof token != Token) {
-        const t = new Token(
-          token._id,
-          token._worth,
-          token._expiry,
-          token._domain
-        );
+        const t = new Token(token.code, token.value, token.expiry, token.label);
         t._added = token._added;
         t._issued_date = token._issued_date;
         t._issued_to = token._issued_to;
-        return t;
+        this._data[token.code] = t;
       }
-      return token;
     });
   }
 
   issue_to(user, number = 1) {
     const issued = [];
     let count = 0;
-    this._data.forEach(token => {
-      if (!token.is_issued() && !token.is_expired() && count < number) {
-        issued.push(token.issue_to(user));
-        count++;
+    Object.values(this._data).forEach(token => {
+      if (token instanceof Token) {
+        if (!token.is_issued() && !token.is_expired() && count < number) {
+          issued.push(token.issue_to(user));
+          count++;
+        }
       }
     });
     return issued;
   }
 
   clean_expired() {
-    this._data = this._data.filter(token => !token.is_expired);
-    return;
+    this._data = Object.values(this._data)
+      .filter(token => token instanceof Token && !token.is_expired())
+      .reduce((obj, code) => {
+        obj[code] = this._data[code];
+        return obj;
+      }, {});
   }
 
-  push(token) {
-    return this._data.push(token);
+  clean_issued() {
+    this._data = Object.values(this._data)
+      .filter(token => token instanceof Token && !token.is_issued())
+      .reduce((obj, code) => {
+        obj[code] = this._data[code];
+        return obj;
+      }, {});
+  }
+
+  push(token, force = false) {
+    if (!token.code) {
+      return TOKEN_STATE.INVALID;
+    }
+    if (token.code in this._data && !force) {
+      return TOKEN_STATE.DUPLICATE;
+    }
+    this._data[token.code] = token;
+    return TOKEN_STATE.COMPLETED;
   }
 
   info() {
+    let total = 0;
     let issued = 0;
     let expired = 0;
-    this._data.forEach(token => {
-      if (token.is_expired()) expired++;
-      if (token.is_issued()) issued++;
+    Object.values(this._data).forEach(token => {
+      if (token instanceof Token) {
+        total++;
+        if (token.is_expired()) expired++;
+        if (token.is_issued()) issued++;
+      }
     });
-    return { total: this._data.length, issued: issued, expired: expired };
+    return { total: total, issued: issued, expired: expired };
   }
 }
 
 class Token {
-  constructor(id, worth, expiry, domain) {
+  constructor(code, value, expiry, label) {
     this.issue_to = this.issue_to.bind(this);
     this.is_issued = this.is_issued.bind(this);
     this.is_expired = this.is_expired.bind(this);
-    this._id = id;
-    this._worth = worth;
-    this._expiry = expiry;
-    this._domain = domain;
+    this.code = code;
+    this.value = value;
+    this.expiry = expiry;
+    this.label = label;
     this._added = new Date();
     this._issued_to = null;
     this._issued_date = null;
@@ -203,10 +231,10 @@ class Token {
     this._issued_to = to;
     this._issued_date = new Date();
     return {
-      id: this._id,
-      worth: this._worth,
-      expiry: this._expiry,
-      domain: this._domain
+      code: this.code,
+      value: this.value,
+      expiry: this.expiry,
+      label: this.label
     };
   }
 
@@ -291,25 +319,68 @@ module.exports = function(robot) {
   );
 
   robot.respond(
-    "/token add token to (.*)/i",
-    { id: "token.token_add" },
+    "/token import to (.*)/i",
+    { id: "token.token_import" },
     res => {
       const bucket = res.match[1];
-      let success = false;
+      let completed = 0;
+      let duplicate = 0;
+      let invalid = 0;
+      let expiry = null;
+      let b;
       if (tokens.exists(bucket)) {
-        const b = tokens.get(bucket);
-        b.push(
-          new Token(
-            random(10),
-            "2 days",
-            null,
-            "http://privateinternetaccess.com"
-          )
-        );
-        res.send(`Added token to bucket ${bucket}.`);
+        b = tokens.get(bucket);
       } else {
         res.send(`Token bucket ${bucket} doesn't exist.`);
+        return;
       }
+      function insertToken(results, parser) {
+        if (!results.data.code || !isString(results.data.code)) {
+          robot.logger.error("Invalid result: ", results);
+          invalid++;
+          return;
+        }
+        if (results.data.expiry) {
+          expiry = Date.parse(results.data.expiry);
+          expiry = !isNaN(date) ? date : null;
+        }
+
+        const token = new Token(
+          results.data.code,
+          results.data.value || results.data.days,
+          expiry,
+          results.data.label
+        );
+        const state = b.push(token);
+        switch (state) {
+          case TOKEN_STATE.COMPLETED:
+            completed++;
+            break;
+          case TOKEN_STATE.DUPLICATE:
+            duplicate++;
+            break;
+          case TOKEN_STATE.INVALID:
+            invalid++;
+        }
+        return;
+      }
+      function complete(results, file) {
+        res.send(
+          `Imported tokens to bucket ${bucket}: ${completed} completed, ${duplicate} duplicate, ${invalid} invalid.`
+        );
+      }
+
+      res.envelope.message.attachments.map(path => {
+        const file = fs.createReadStream(path);
+        robot.logger.debug("Parsing path: ", path);
+        Papa.parse(file, {
+          step: insertToken,
+          complete: complete,
+          header: true,
+          dynamicTyping: true
+        });
+      });
+      robot.logger.debug("end of function");
     }
   );
 
@@ -358,17 +429,17 @@ module.exports = function(robot) {
             response.push("You have been issued the following tokens:");
             issued.forEach(t => {
               const tokenString = [];
-              if (t.id != null) {
-                tokenString.push(`Token: ${t.id}`);
+              if (t.code != null) {
+                tokenString.push(`Code: ${t.code}`);
               }
-              if (t.domain != null) {
-                tokenString.push(`for site ${t.domain}`);
+              if (t.label != null) {
+                tokenString.push(` for site ${t.label}`);
               }
-              if (t.domain != null) {
-                tokenString.push(`worth ${t.worth}`);
+              if (t.label != null) {
+                tokenString.push(` value ${t.value}`);
               }
               if (t.expiry != null) {
-                tokenString.push(`expiring ${t.date.toDateString()}`);
+                tokenString.push(` expiring ${t.date.toDateString()}`);
               }
               tokenString.join(` `);
               response.push(tokenString);
