@@ -1,35 +1,31 @@
 // Description:
-//   A script that expands mentions of lists. Lists themselves can be used as
-//   members if prepended with '&', and mentions will be expanded recursively.
+//   A script that manages and distributes arbitrary buckets of tokens. Tokens
+//   are imported from CSV files, and there is special handling for account
+//   and voucher tokens for the Mullvad VPN provider. Requires hubot-list.
 //
 // Dependencies:
 //   None
 //
-// Configuration:
-//   HUBOT_LIST_DECORATOR - a character indicating how to decorate usernames.
-//     Valid settings are '<', '(', '[', and '{'. This variable can also be left
-//     unset. This setting defaults to ''.
-//   HUBOT_LIST_PREPEND_USERNAME - set to 'false' to disable prepending the
-//     original username to the prepended message. This variable can also be
-//     left unset. This setting defaults to 'true'.
-//   HUBOT_LIST_RECURSE - set to 'false' to disable recursive list expansion.
-//     The setting defaults to 'true'.
-//
 // Commands:
 //   hubot token show buckets - list all token buckets
-//   hubot token create bucket <bucket> - create a new token bucket
-//   hubot token destroy bucket <bucket> - destroy a token bucket
-//   hubot token issue <number> tokens from <bucket> to <user> - issue tokens
+//   hubot token show users - list all valid recipients
+//   hubot token create [bucket] <bucket> [of mullvadaccounts|mullvadcodes]- create a new token bucket
+//   hubot token destroy [bucket] <bucket> - destroy a token bucket
+//   hubot import to <bucket> - import CSV file to bucket, must use an adapter with file attachments (currently only Signal supported)
+//   hubot token issue <number> token[s] from <bucket> to <user> - issue tokens
+//   hubot token apply [token] [with value N] from <bucket> to <user> - apply voucher code to user's account (Mullvad only)
 //
 // Author:
-//   Josh King <jking@chambana.net>, based on hubot-group by anishathalye
+//   Josh King <josh@throneless.tech>
 //
 
+const Conversation = require("hubot-conversation");
 const Papa = require("papaparse");
 const crypto = require("crypto");
 const fs = require("fs");
 const IDENTIFIER = "[-._a-zA-Z0-9]+";
 const TOKEN_STATE = { COMPLETED: 0, DUPLICATE: 1, INVALID: 2 };
+const MULLVAD_URL = "https://api.mullvad.net/public/vouchers/submit/v1/";
 
 function isString(s) {
   return typeof s === "string" || s instanceof String;
@@ -80,7 +76,17 @@ class BucketList {
       this.cache = this.robot.brain.data.tokens;
       Object.entries(this.robot.brain.data.tokens).forEach(([name, bucket]) => {
         if (bucket) {
-          const deserialized = new Bucket();
+          let deserialized;
+          switch (bucket._type) {
+            case "MullvadCodes":
+              deserialized = new MullvadCodes();
+              break;
+            case "MullvadAccounts":
+              deserialized = new MullvadAccounts();
+              break;
+            default:
+              deserialized = new Bucket();
+          }
           deserialized.load(bucket._data);
           this.cache[name] = deserialized;
         }
@@ -134,11 +140,12 @@ class BucketList {
 }
 
 class Bucket {
-  constructor() {
+  constructor(_type = "generic") {
     this.issue_to = this.issue_to.bind(this);
     this.clean_expired = this.clean_expired.bind(this);
     this.push = this.push.bind(this);
     this.info = this.info.bind(this);
+    this._type = _type;
     this._data = {};
   }
 
@@ -146,9 +153,14 @@ class Bucket {
     this._data = data;
     Object.values(this._data).forEach(token => {
       if (typeof token != Token) {
-        const t = new Token(token.code, token.value, token.expiry, token.label);
-        t._added = token._added;
-        t._issued_date = token._issued_date;
+        const expiry = token.expiry ? Date.parse(String(token.expiry)) : null;
+        const added = token._added ? Date.parse(String(token._added)) : null;
+        const issued_date = token._issued_date
+          ? Date.parse(String(token._issued_date))
+          : null;
+        const t = new Token(token.code, token.value, expiry, token.label);
+        t._added = added;
+        t._issued_date = issued_date;
         t._issued_to = token._issued_to;
         this._data[token.code] = t;
       }
@@ -161,7 +173,8 @@ class Bucket {
     Object.values(this._data).forEach(token => {
       if (token instanceof Token) {
         if (!token.is_issued() && !token.is_expired() && count < number) {
-          issued.push(token.issue_to(user));
+          issued.push(token.issue_to(user.id));
+          user._issued = user._issued ? ++user._issued : 1;
           count++;
         }
       }
@@ -213,8 +226,87 @@ class Bucket {
   }
 }
 
+class MullvadCodes extends Bucket {
+  constructor() {
+    super("MullvadCodes");
+  }
+
+  get_code(value) {
+    const sorted = Object.values(this._data)
+      .sort((t1, t2) => (t1.expiry < t2.expiry ? -1 : 1))
+      .filter(t => !t.is_issued() && !t.is_expired());
+    if (value) {
+      return sorted.find(t => t === value);
+    } else {
+      return sorted[0];
+    }
+  }
+
+  apply_to(robot, user, accountNumber, token) {
+    if (!(user._accounts && user._accounts instanceof Array)) {
+      user._accounts = new Array();
+    }
+    if (
+      !token.is_issued() &&
+      !token.is_expired() &&
+      user._accounts[accountNumber]
+    ) {
+      const data = `account=${user._accounts[accountNumber]}&code=${token.code}`;
+      robot
+        .http(MULLVAD_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .post(data)((err, resp, body) => {
+        if (err) {
+          robot.logger.debug(`Error calling Mullvad API: ${err.code}`);
+          return false;
+        }
+        switch (resp.statusCode) {
+          case 200:
+            robot.logger.debug(
+              `Successfully applied Mullvad voucher ${data.code} to ${data.account}.`
+            );
+            token.issue_to(user.id);
+            return true;
+          default:
+            robot.logger.debug(
+              `Mullvad API error code ${resp.statusCode}: ${body}.`
+            );
+            return false;
+        }
+      });
+    } else {
+      return false;
+    }
+  }
+}
+
+class MullvadAccounts extends Bucket {
+  constructor() {
+    super("MullvadAccounts");
+  }
+
+  issue_to(user, number = 1) {
+    const issued = [];
+    let count = 0;
+    if (!(user._accounts && user._accounts instanceof Array)) {
+      user._accounts = new Array();
+    }
+    Object.values(this._data).forEach(token => {
+      if (token instanceof Token) {
+        if (!token.is_issued() && !token.is_expired() && count < number) {
+          issued.push(token.issue_to(user.id));
+          user._accounts.push(token.code);
+          user._issued = user._issued ? user._issued++ : 1;
+          count++;
+        }
+      }
+    });
+    return issued;
+  }
+}
+
 class Token {
-  constructor(code, value, expiry, label) {
+  constructor(code, value = 0, expiry, label, options = {}) {
     this.issue_to = this.issue_to.bind(this);
     this.is_issued = this.is_issued.bind(this);
     this.is_expired = this.is_expired.bind(this);
@@ -222,6 +314,7 @@ class Token {
     this.value = value;
     this.expiry = expiry;
     this.label = label;
+    this.options = options;
     this._added = new Date();
     this._issued_to = null;
     this._issued_date = null;
@@ -254,6 +347,7 @@ class Token {
 
 module.exports = function(robot) {
   const tokens = new BucketList(robot);
+  const switchBoard = new Conversation(robot);
 
   robot.listenerMiddleware((context, next, done) => {
     if (
@@ -262,7 +356,7 @@ module.exports = function(robot) {
         new RegExp(`^token\\.[a-zA-Z0-9]+$`, "i")
       )
     ) {
-      if (robot.auth.isAdmin(context.response.message.user.id)) {
+      if (robot.auth.isAdmin(context.response.message.user)) {
         // User is allowed access to this command
         return next();
       } else {
@@ -279,22 +373,33 @@ module.exports = function(robot) {
   });
 
   robot.respond(
-    "/token create bucket (.*)/i",
-    { id: "token.bucket_add" },
+    "/token create( bucket)? (\\S*)( of)?\\s?(.*)/i",
+    { id: "token.bucket_create" },
     res => {
-      const name = res.match[1];
-      const type = res.match[2];
+      const name = res.match[2];
+      let type = res.match[4];
+      type = type ? type : "";
       let success = false;
-      if (type === "mullvad" || type === "Mullvad") {
-        const bucket = new Bucket();
-        success = tokens.set(name, bucket);
-      } else {
-        const bucket = new Bucket();
-        success = tokens.set(name, bucket);
+      let bucket, msg;
+      switch (type.toLowerCase()) {
+        case "mullvadcodes":
+          bucket = new MullvadCodes();
+          success = tokens.set(name, bucket);
+          msg = `Added new bucket ${name} of Mullvad voucher codes.`;
+          break;
+        case "mullvadaccounts":
+          bucket = new MullvadAccounts();
+          success = tokens.set(name, bucket);
+          msg = `Added new bucket ${name} of Mullvad accounts.`;
+          break;
+        default:
+          bucket = new Bucket();
+          success = tokens.set(name, bucket);
+          msg = `Added new token bucket ${name}.`;
       }
 
       if (success) {
-        res.send(`Added new token bucket ${name}.`);
+        res.send(msg);
       } else {
         res.send(`Token bucket ${name} already exists.`);
       }
@@ -302,8 +407,8 @@ module.exports = function(robot) {
   );
 
   robot.respond(
-    "/token destroy bucket (.*)/i",
-    { id: "token.bucket_remove" },
+    "/token destroy(?:\\sbucket)?\\s(.*)/i",
+    { id: "token.bucket_destroy" },
     res => {
       const name = res.match[1];
       let success = false;
@@ -318,73 +423,68 @@ module.exports = function(robot) {
     }
   );
 
-  robot.respond(
-    "/token import to (.*)/i",
-    { id: "token.token_import" },
-    res => {
-      const bucket = res.match[1];
-      let completed = 0;
-      let duplicate = 0;
-      let invalid = 0;
-      let expiry = null;
-      let b;
-      if (tokens.exists(bucket)) {
-        b = tokens.get(bucket);
-      } else {
-        res.send(`Token bucket ${bucket} doesn't exist.`);
-        return;
-      }
-      function insertToken(results, parser) {
-        if (!results.data.code || !isString(results.data.code)) {
-          robot.logger.error("Invalid result: ", results);
-          invalid++;
-          return;
-        }
-        if (results.data.expiry) {
-          expiry = Date.parse(results.data.expiry);
-          expiry = !isNaN(date) ? date : null;
-        }
-
-        const token = new Token(
-          results.data.code,
-          results.data.value || results.data.days,
-          expiry,
-          results.data.label
-        );
-        const state = b.push(token);
-        switch (state) {
-          case TOKEN_STATE.COMPLETED:
-            completed++;
-            break;
-          case TOKEN_STATE.DUPLICATE:
-            duplicate++;
-            break;
-          case TOKEN_STATE.INVALID:
-            invalid++;
-        }
-        return;
-      }
-      function complete(results, file) {
-        res.send(
-          `Imported tokens to bucket ${bucket}: ${completed} completed, ${duplicate} duplicate, ${invalid} invalid.`
-        );
-      }
-
-      res.envelope.message.attachments.map(path => {
-        const file = fs.createReadStream(path);
-        robot.logger.debug("Parsing path: ", path);
-        Papa.parse(file, {
-          step: insertToken,
-          complete: complete,
-          header: true,
-          dynamicTyping: true
-        });
-      });
-      robot.logger.debug("end of function");
+  robot.respond("/token import to (.*)/i", { id: "token.import" }, res => {
+    const bucket = res.match[1];
+    let completed = 0;
+    let duplicate = 0;
+    let invalid = 0;
+    let expiry = null;
+    let b;
+    if (tokens.exists(bucket)) {
+      b = tokens.get(bucket);
+    } else {
+      res.send(`Token bucket ${bucket} doesn't exist.`);
+      return;
     }
-  );
+    function insertToken(results, parser) {
+      if (!results.data.code) {
+        robot.logger.error("Invalid result: ", results);
+        invalid++;
+        return;
+      }
+      if (results.data.expiry) {
+        expiry = Date.parse(String(results.data.expiry));
+        expiry = !isNaN(expiry) ? expiry : null;
+      }
 
-  robot.respond("/token show buckets/i", { id: "token.list_buckets" }, res => {
+      const token = new Token(
+        results.data.code,
+        results.data.value || results.data.days,
+        expiry,
+        results.data.label
+      );
+      const state = b.push(token);
+      switch (state) {
+        case TOKEN_STATE.COMPLETED:
+          completed++;
+          break;
+        case TOKEN_STATE.DUPLICATE:
+          duplicate++;
+          break;
+        case TOKEN_STATE.INVALID:
+          invalid++;
+      }
+      return;
+    }
+    function complete(results, file) {
+      res.send(
+        `Imported tokens to bucket ${bucket}: ${completed} completed, ${duplicate} duplicate, ${invalid} invalid.`
+      );
+    }
+
+    res.envelope.message.attachments.map(path => {
+      const file = fs.createReadStream(path);
+      robot.logger.debug("Parsing path: ", path);
+      Papa.parse(file, {
+        step: insertToken,
+        complete: complete,
+        header: true,
+        dynamicTyping: true
+      });
+    });
+  });
+
+  robot.respond("/token show buckets/i", { id: "token.show_buckets" }, res => {
     const response = [];
     response.push("<Bucket>: (Total/Issued/Expired)");
     Object.entries(tokens.cache).forEach(([name, bucket]) => {
@@ -398,9 +498,15 @@ module.exports = function(robot) {
     }
   });
 
-  robot.respond("/token show users/i", { id: "token.list_users" }, res => {
-    const response = robot.auth.usersWithRole("recipients");
-    response.unshift("Users:");
+  robot.respond("/token show users/i", { id: "token.show_users" }, res => {
+    const response = robot.auth.usersWithRole("recipients").map(id => {
+      let user = robot.brain.userForId(id);
+      let name = user.name ? user.name : id;
+      let issued = user._issued ? user._issued : 0;
+
+      return `${name}: ${issued}`;
+    });
+    response.unshift("<User>: <# of Tokens issued>");
     if (response.length > 1) {
       res.send(response.join("\n"));
     } else {
@@ -411,46 +517,128 @@ module.exports = function(robot) {
   });
 
   robot.respond(
-    "/token issue (.*) tokens from (.*) to (.*)/i",
-    { id: "token.list_issue" },
+    "/token apply( token)?( with value)?(.*) from (.*) to (.*)/i",
+    { id: "token.apply_to" },
+    res => {
+      const value = res.match[3];
+      const bucket = res.match[4];
+      const user = res.match[5];
+      if (tokens.exists(bucket)) {
+        const bucketObject = tokens.get(bucket);
+        if (bucketObject instanceof MullvadCodes) {
+          const userObject = robot.brain.userForName(user);
+          if (robot.auth.hasRole(userObject, "recipients")) {
+            const token = bucketObject.get_code(value);
+            if (token) {
+              const userObject = robot.brain.userForName(user);
+              const accounts = userObject._accounts ? userObject._accounts : [];
+              switch (accounts.length) {
+                case 0:
+                  res.send(
+                    `Account ${user} has no issued Mullvad accounts to which this code can be applied.`
+                  );
+                  break;
+                case 1:
+                  if (bucketObject.apply_to(robot, userObject, 0, token)) {
+                    res.send(`Applied token's value to ${user}'s account.`);
+                  } else {
+                    res.send(
+                      `Failed to apply the token's value to ${user}'s account.`
+                    );
+                  }
+                  break;
+                default:
+                  const dialog = switchBoard.startDialog(res);
+                  const response = [];
+                  response.push(
+                    `User ${user} has the following ${accounts.length} accounts, please reply with the number of the account to which you'd like the code applied:`
+                  );
+                  accounts.forEach((account, index) => {
+                    response.push(`${index}: ${account}`);
+                    dialog.addChoice(/([0-9])+/i, msg => {
+                      const choice = parseInt(msg.match[1], 10);
+                      robot.logger.debug(`The choice is ${choice}.`);
+                      if (accounts[choice]) {
+                        if (
+                          bucketObject.apply_to(
+                            robot,
+                            userObject,
+                            choice,
+                            token
+                          )
+                        ) {
+                          msg.reply(
+                            `Applied code's value to ${user}'s account.`
+                          );
+                        } else {
+                          msg.reply(
+                            `Failed to apply code's value to ${user}'s account.`
+                          );
+                        }
+                      } else {
+                        msg.reply(`${choice} is not a valid selection.`);
+                      }
+                    });
+                  });
+                  res.send(response.join("\n"));
+              }
+            } else {
+              res.send("No valid code available.");
+            }
+          } else {
+            res.send(`User ${user} is not a valid recipient.`);
+          }
+        } else {
+          res.send(`Token bucket ${bucket} must be of type MullvadCodes.`);
+        }
+      } else {
+        res.send(`Token bucket ${bucket} doesn't exist.`);
+      }
+    }
+  );
+
+  robot.respond(
+    "/token issue (.*) token(s)? from (.*) to (.*)/i",
+    { id: "token.issue" },
     res => {
       const number = res.match[1] || 1;
-      const bucket = res.match[2];
-      const user = res.match[3];
+      const bucket = res.match[3];
+      const user = res.match[4];
       if (tokens.exists(bucket)) {
-        if (robot.auth.hasRole(user, "recipients")) {
-          const issued = tokens.get(bucket).issue_to(user, number);
-          const userObject = robot.brain.userForId(user);
+        const userObject = robot.brain.userForName(user);
+        if (robot.auth.hasRole(userObject, "recipients")) {
+          const issued = tokens.get(bucket).issue_to(userObject, number);
           userObject.issued = userObject.issued
             ? (userObject.issued += issued)
             : issued;
           if (issued.length > 0) {
-            const response = [];
-            response.push("You have been issued the following tokens:");
+            const msg = [];
+            msg.push("You have been issued the following tokens:");
             issued.forEach(t => {
               const tokenString = [];
               if (t.code != null) {
                 tokenString.push(`Code: ${t.code}`);
               }
               if (t.label != null) {
-                tokenString.push(` for site ${t.label}`);
+                tokenString.push(` labeled ${t.label}`);
               }
-              if (t.label != null) {
-                tokenString.push(` value ${t.value}`);
+              if (t.value != null) {
+                tokenString.push(` with value ${t.value}`);
               }
-              if (t.expiry != null) {
-                tokenString.push(` expiring ${t.date.toDateString()}`);
+              if (t.expiry != null && !isNaN(t.expiry)) {
+                tokenString.push(` expiring ${t.expiry.toString()}`);
               }
               tokenString.join(` `);
-              response.push(tokenString);
+              msg.push(tokenString);
             });
-            robot.messageRoom(user, response.join("\n"));
-            res.send(`Sent ${issued.length} tokens to ${user}.`);
+            Promise.resolve(robot.messageRoom(user, msg.join("\n"))).then(() =>
+              res.send(`Sent ${issued.length} tokens to ${user}.`)
+            );
           } else {
             res.send(`No tokens available in bucket ${bucket}.`);
           }
         } else {
-          res.send(`User ${res.match[3]} is not a valid recipient.`);
+          res.send(`User ${user} is not a valid recipient.`);
         }
       } else {
         res.send(`Token bucket ${bucket} doesn't exist.`);
